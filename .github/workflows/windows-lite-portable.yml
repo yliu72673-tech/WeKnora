@@ -1,0 +1,227 @@
+name: Build WeKnora Lite Windows Portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label, for example v0.7.0-lite-test3"
+        required: true
+        default: "v0.7.0-lite-test3"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+  NODE_VERSION: "22"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  prepare-frontend-and-bindings:
+    name: Prepare frontend and Wails bindings
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Install matching Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Generate Wails bindings on Linux
+        shell: bash
+        run: |
+          export EDITION=lite
+          export CGO_ENABLED=1
+          export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
+          cd cmd/desktop
+          wails generate module
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Archive frontend and generated bindings
+        shell: bash
+        run: |
+          tar -czf frontend-and-bindings.tar.gz \
+            -C frontend \
+            dist \
+            src/wailsjs
+
+      - name: Upload prepared frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-and-bindings
+          path: frontend-and-bindings.tar.gz
+          retention-days: 1
+
+  build-windows-portable:
+    name: Build Windows x64 portable package
+    needs: prepare-frontend-and-bindings
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: 1
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download prepared frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-and-bindings
+
+      - name: Extract frontend and bindings
+        shell: bash
+        run: |
+          mkdir -p frontend
+          tar -xzf frontend-and-bindings.tar.gz -C frontend/
+
+      - name: Install matching Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Prepare SQLite headers
+        shell: bash
+        run: |
+          HEADER_DIR="${GITHUB_WORKSPACE}/_sqlite_headers"
+          mkdir -p "${HEADER_DIR}"
+          curl -fsSL \
+            "https://raw.githubusercontent.com/mattn/go-sqlite3/v1.14.22/sqlite3-binding.h" \
+            -o "${HEADER_DIR}/sqlite3.h"
+          curl -fsSL \
+            "https://raw.githubusercontent.com/mattn/go-sqlite3/v1.14.22/sqlite3ext.h" \
+            -o "${HEADER_DIR}/sqlite3ext.h"
+          echo "SQLITE_HEADER_DIR=${HEADER_DIR}" >> "$GITHUB_ENV"
+
+      - name: Build Windows desktop application
+        shell: bash
+        run: |
+          set -e
+          export EDITION=lite
+          export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
+          export GOFLAGS="-p=1"
+
+          eval "$(./scripts/get_version.sh env)"
+          LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I${SQLITE_HEADER_DIR}"
+
+          cd cmd/desktop
+
+          # Bindings and frontend were prepared on Linux.
+          # This avoids the Windows Go AST/GC crash seen in the original workflow.
+          wails build \
+            -clean \
+            -skipbindings \
+            -s \
+            -tags "sqlite_fts5" \
+            -platform "windows/amd64" \
+            -ldflags="${LDFLAGS}" \
+            -o "WeKnora Lite.exe"
+
+      - name: Assemble portable folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = "${{ inputs.version }}"
+          $portable = "WeKnora-Lite-Windows-x64-$version-Portable"
+
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          New-Item -ItemType Directory -Force -Path "$portable\config" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$portable\migrations\sqlite" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$portable\web" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$portable\jieba_dict" | Out-Null
+
+          Copy-Item "cmd\desktop\build\bin\WeKnora Lite.exe" "$portable\WeKnora Lite.exe"
+
+          if (Test-Path ".env.lite.example") {
+            Copy-Item ".env.lite.example" "$portable\.env"
+          }
+
+          if (Test-Path "docs\LITE.md") {
+            Copy-Item "docs\LITE.md" "$portable\README.md"
+          }
+
+          if (Test-Path "config") {
+            Copy-Item "config\*" "$portable\config\" -Recurse -Force
+          }
+
+          if (Test-Path "migrations\sqlite") {
+            Copy-Item "migrations\sqlite\*" "$portable\migrations\sqlite\" -Recurse -Force
+          }
+
+          if (Test-Path "frontend\dist") {
+            Copy-Item "frontend\dist\*" "$portable\web\" -Recurse -Force
+          }
+
+          $goModCache = (go env GOMODCACHE).Trim()
+          $jiebaRoot = Join-Path $goModCache "github.com\yanyiwu"
+
+          if (Test-Path $jiebaRoot) {
+            $jiebaModule = Get-ChildItem $jiebaRoot -Directory |
+              Where-Object { $_.Name -like "gojieba@*" } |
+              Select-Object -First 1
+
+            if ($jiebaModule) {
+              $dict = Join-Path $jiebaModule.FullName "deps\cppjieba\dict"
+              if (Test-Path $dict) {
+                Copy-Item "$dict\jieba.dict.utf8" "$portable\jieba_dict\" -ErrorAction SilentlyContinue
+                Copy-Item "$dict\hmm_model.utf8" "$portable\jieba_dict\" -ErrorAction SilentlyContinue
+                Copy-Item "$dict\user.dict.utf8" "$portable\jieba_dict\" -ErrorAction SilentlyContinue
+                Copy-Item "$dict\idf.utf8" "$portable\jieba_dict\" -ErrorAction SilentlyContinue
+                Copy-Item "$dict\stop_words.utf8" "$portable\jieba_dict\" -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+          @"
+          WeKnora Lite Windows Portable
+
+          1. Keep this entire folder together.
+          2. Double-click "WeKnora Lite.exe".
+          3. This package does not require Docker, WSL, Hyper-V, PostgreSQL, or Redis.
+          4. If Windows SmartScreen appears, choose More info, then Run anyway.
+          5. Do not delete the web, config, migrations, or jieba_dict folders.
+          "@ | Set-Content -Encoding UTF8 "$portable\START-HERE.txt"
+
+          Compress-Archive -Path $portable -DestinationPath "$portable.zip" -Force
+
+          $hash = (Get-FileHash "$portable.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $portable.zip" | Set-Content -Encoding ASCII "$portable.zip.sha256"
+
+      - name: Upload Windows portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeKnora-Lite-Windows-x64-Portable
+          path: |
+            WeKnora-Lite-Windows-x64-*-Portable.zip
+            WeKnora-Lite-Windows-x64-*-Portable.zip.sha256
+          retention-days: 7
